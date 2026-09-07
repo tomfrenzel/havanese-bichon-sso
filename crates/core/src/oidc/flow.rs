@@ -256,10 +256,13 @@ pub async fn complete_login(state: &str, code: &str) -> BichonResult<OidcCallbac
             expected_audience: cfg.client_id,
             expected_nonce: &pending.nonce,
             client_secret: cfg.client_secret.as_bytes(),
+            jwks_uri: &discovery.jwks_uri,
+            supported_algorithms: &discovery.id_token_signing_alg_values_supported,
             clock_skew_secs: 60,
             now_secs,
         },
-    )?;
+    )
+    .await?;
 
     // Best-effort cleanup; failure to delete the pending entry must not abort login.
     if let Err(e) = OidcPendingEntity::delete(state) {

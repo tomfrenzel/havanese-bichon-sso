@@ -20,5 +20,6 @@ pub mod discovery;
 pub mod flow;
 pub mod handoff;
 pub mod id_token;
+pub mod jwks;
 pub mod pending;
 pub mod task;
