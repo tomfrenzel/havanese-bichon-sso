@@ -272,9 +272,10 @@ a new user with `BICHON_OIDC_DEFAULT_ROLE_ID`. The `sub` claim from the IdP
 is stored on the user and used for subsequent logins.
 
 **Signature verification.** The ID token is verified with HS256 using the
-client secret. Only signed tokens are accepted — other algorithms are
-rejected until JWKS-based asymmetric verification is added. Discovery,
-issuer, audience, expiration (with 60 s skew), and nonce are validated.
+client secret, or with RS256/ES256 using the provider's discovered JWKS.
+Signing keys are cached and refreshed when an unknown `kid` is encountered.
+Only algorithms advertised by the provider are accepted. Discovery, issuer,
+audience, expiration (with 60 s skew), and nonce are validated.
 
 **Token handoff.** After a successful callback the SPA receives a one-shot
 handoff id in the URL and POSTs it to `/api/auth/oidc/handoff` to obtain the

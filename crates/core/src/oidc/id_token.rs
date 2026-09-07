@@ -18,9 +18,10 @@
 
 use crate::error::code::ErrorCode;
 use crate::error::BichonResult;
+use crate::oidc::jwks::{get_jwks, Jwk, JwkSet};
 use crate::raise_error;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use ring::{digest, hmac};
+use ring::{digest, hmac, signature};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -66,7 +67,6 @@ pub struct IdTokenClaims {
 struct Header {
     alg: String,
     #[serde(default)]
-    #[allow(dead_code)]
     kid: Option<String>,
     #[serde(default)]
     #[allow(dead_code)]
@@ -79,6 +79,8 @@ pub struct VerifyParams<'a> {
     pub expected_nonce: &'a str,
     /// Client secret bytes, required for HS256 verification. Ignored for other algs.
     pub client_secret: &'a [u8],
+    pub jwks_uri: &'a str,
+    pub supported_algorithms: &'a [String],
     /// Clock skew tolerance in seconds.
     pub clock_skew_secs: i64,
     /// Current unix time in seconds.
@@ -116,18 +118,119 @@ fn audience_matches(claim: &Value, expected: &str) -> bool {
     }
 }
 
+fn matching_key<'a>(set: &'a JwkSet, header: &Header) -> BichonResult<&'a Jwk> {
+    let expected_kty = match header.alg.as_str() {
+        "RS256" => "RSA",
+        "ES256" => "EC",
+        _ => unreachable!(),
+    };
+    let candidates: Vec<&Jwk> = set
+        .keys
+        .iter()
+        .filter(|key| {
+            key.kty == expected_kty
+                && key.key_use.as_deref() != Some("enc")
+                && key
+                    .alg
+                    .as_deref()
+                    .map(|alg| alg == header.alg)
+                    .unwrap_or(true)
+                && header
+                    .kid
+                    .as_deref()
+                    .map(|kid| key.kid.as_deref() == Some(kid))
+                    .unwrap_or(true)
+        })
+        .collect();
+
+    if candidates.len() != 1 {
+        return Err(raise_error!(
+            format!(
+                "OIDC JWKS contains {} matching keys for alg '{}' and kid {:?}",
+                candidates.len(),
+                header.alg,
+                header.kid
+            ),
+            ErrorCode::PermissionDenied
+        ));
+    }
+    Ok(candidates[0])
+}
+
+fn required_jwk_member<'a>(
+    key: &'a Jwk,
+    value: &'a Option<String>,
+    name: &str,
+) -> BichonResult<&'a str> {
+    value.as_deref().ok_or_else(|| {
+        raise_error!(
+            format!("OIDC {} key {:?} is missing '{}'", key.kty, key.kid, name),
+            ErrorCode::InvalidParameter
+        )
+    })
+}
+
+fn verify_asymmetric(
+    header: &Header,
+    key: &Jwk,
+    signing_input: &[u8],
+    signature_bytes: &[u8],
+) -> BichonResult<()> {
+    let verification = match header.alg.as_str() {
+        "RS256" => {
+            let n = b64url_decode(required_jwk_member(key, &key.n, "n")?)?;
+            let e = b64url_decode(required_jwk_member(key, &key.e, "e")?)?;
+            signature::RsaPublicKeyComponents { n: &n, e: &e }.verify(
+                &signature::RSA_PKCS1_2048_8192_SHA256,
+                signing_input,
+                signature_bytes,
+            )
+        }
+        "ES256" => {
+            if key.crv.as_deref() != Some("P-256") {
+                return Err(raise_error!(
+                    format!("OIDC EC key {:?} does not use P-256", key.kid),
+                    ErrorCode::InvalidParameter
+                ));
+            }
+            let x = b64url_decode(required_jwk_member(key, &key.x, "x")?)?;
+            let y = b64url_decode(required_jwk_member(key, &key.y, "y")?)?;
+            if x.len() != 32 || y.len() != 32 {
+                return Err(raise_error!(
+                    format!("OIDC EC key {:?} has invalid P-256 coordinates", key.kid),
+                    ErrorCode::InvalidParameter
+                ));
+            }
+            let mut public_key = Vec::with_capacity(65);
+            public_key.push(4);
+            public_key.extend_from_slice(&x);
+            public_key.extend_from_slice(&y);
+            signature::UnparsedPublicKey::new(&signature::ECDSA_P256_SHA256_FIXED, public_key)
+                .verify(signing_input, signature_bytes)
+        }
+        _ => unreachable!(),
+    };
+
+    verification.map_err(|_| {
+        raise_error!(
+            format!("ID token {} signature verification failed", header.alg),
+            ErrorCode::PermissionDenied
+        )
+    })
+}
+
 /// Verify and parse the ID token.
 ///
 /// The signature is verified for `HS256` using the OAuth client secret shared
-/// with the IdP. Any other algorithm is rejected — asymmetric verification via
-/// JWKS is intentionally not implemented yet, and silently trusting an
-/// unverified signature would enable token forgery if the IdP or the transport
-/// were ever compromised.
+/// with the IdP, or for `RS256` and `ES256` using the provider's JWKS.
 ///
 /// After the signature check all standard OIDC claims are validated: `iss`,
 /// `aud`, `exp` (with configurable skew), and `nonce` (constant-time compare
 /// to defeat timing attacks).
-pub fn verify_and_parse(token: &str, params: &VerifyParams<'_>) -> BichonResult<IdTokenClaims> {
+pub async fn verify_and_parse(
+    token: &str,
+    params: &VerifyParams<'_>,
+) -> BichonResult<IdTokenClaims> {
     let (h_b64, p_b64, s_b64) = split_jwt(token)?;
 
     let header_bytes = b64url_decode(h_b64)?;
@@ -138,10 +241,25 @@ pub fn verify_and_parse(token: &str, params: &VerifyParams<'_>) -> BichonResult<
         )
     })?;
 
+    if !params.supported_algorithms.is_empty()
+        && !params
+            .supported_algorithms
+            .iter()
+            .any(|alg| alg == &header.alg)
+    {
+        return Err(raise_error!(
+            format!(
+                "OIDC provider does not advertise ID token algorithm '{}'",
+                header.alg
+            ),
+            ErrorCode::PermissionDenied
+        ));
+    }
+
+    let signature_bytes = b64url_decode(s_b64)?;
+    let signing_input = format!("{}.{}", h_b64, p_b64);
     match header.alg.as_str() {
         "HS256" => {
-            let signature = b64url_decode(s_b64)?;
-            let signing_input = format!("{}.{}", h_b64, p_b64);
             // Not the raw client_secret bytes: empirically, Authelia signs
             // HS256 ID tokens with SHA-256(client_secret) as the HMAC key,
             // not the secret's raw bytes as OIDC Core 1.0 sec. 10.1 literally
@@ -149,19 +267,30 @@ pub fn verify_and_parse(token: &str, params: &VerifyParams<'_>) -> BichonResult<
             // which appears to apply this derivation internally.
             let derived_key = digest::digest(&digest::SHA256, params.client_secret);
             let key = hmac::Key::new(hmac::HMAC_SHA256, derived_key.as_ref());
-            hmac::verify(&key, signing_input.as_bytes(), &signature).map_err(|_| {
+            hmac::verify(&key, signing_input.as_bytes(), &signature_bytes).map_err(|_| {
                 raise_error!(
                     "ID token HS256 signature verification failed".into(),
                     ErrorCode::PermissionDenied
                 )
             })?;
         }
+        "RS256" | "ES256" => {
+            let mut set = get_jwks(params.jwks_uri, false).await?;
+            let key = match matching_key(&set, &header) {
+                Ok(key) => key,
+                Err(_) if header.kid.is_some() => {
+                    set = get_jwks(params.jwks_uri, true).await?;
+                    matching_key(&set, &header)?
+                }
+                Err(error) => return Err(error),
+            };
+            verify_asymmetric(&header, key, signing_input.as_bytes(), &signature_bytes)?;
+        }
         other => {
             return Err(raise_error!(
                 format!(
-                    "Unsupported ID token signing algorithm '{}'. Configure your \
-                     OIDC provider to use HS256, or extend Bichon with JWKS-based \
-                     verification for asymmetric algorithms.",
+                    "Unsupported ID token signing algorithm '{}'. Supported algorithms \
+                     are HS256, RS256, and ES256.",
                     other
                 ),
                 ErrorCode::PermissionDenied
@@ -214,4 +343,113 @@ pub fn verify_and_parse(token: &str, params: &VerifyParams<'_>) -> BichonResult<
     }
 
     Ok(claims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PAYLOAD: &str = "eyJpc3MiOiJqb2UiLA0KICJleHAiOjEzMDA4MTkzODAsDQogImh0dHA6Ly9leGFtcGxlLmNvbS9pc19yb290Ijp0cnVlfQ";
+
+    fn jwk(kty: &str, alg: &str, kid: &str) -> Jwk {
+        Jwk {
+            kty: kty.to_string(),
+            kid: Some(kid.to_string()),
+            alg: Some(alg.to_string()),
+            key_use: Some("sig".to_string()),
+            n: None,
+            e: None,
+            crv: None,
+            x: None,
+            y: None,
+        }
+    }
+
+    #[test]
+    fn selects_key_by_algorithm_and_kid() {
+        let set = JwkSet {
+            keys: vec![jwk("RSA", "RS256", "old"), jwk("RSA", "RS256", "current")],
+        };
+        let header = Header {
+            alg: "RS256".to_string(),
+            kid: Some("current".to_string()),
+            typ: None,
+        };
+
+        assert_eq!(
+            matching_key(&set, &header).unwrap().kid.as_deref(),
+            Some("current")
+        );
+    }
+
+    #[test]
+    fn rejects_ambiguous_key_without_kid() {
+        let set = JwkSet {
+            keys: vec![jwk("RSA", "RS256", "one"), jwk("RSA", "RS256", "two")],
+        };
+        let header = Header {
+            alg: "RS256".to_string(),
+            kid: None,
+            typ: None,
+        };
+
+        assert!(matching_key(&set, &header).is_err());
+    }
+
+    #[test]
+    fn verifies_rs256_rfc7515_vector() {
+        let header = Header {
+            alg: "RS256".to_string(),
+            kid: None,
+            typ: None,
+        };
+        let mut key = jwk("RSA", "RS256", "rfc7515");
+        key.n = Some(
+            concat!(
+                "ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-",
+                "Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6",
+                "b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-",
+                "KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_",
+                "I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9",
+                "gb54h4FRWyuXpoQ"
+            )
+            .to_string(),
+        );
+        key.e = Some("AQAB".to_string());
+        let input = format!("eyJhbGciOiJSUzI1NiJ9.{}", PAYLOAD);
+        let signature_bytes = b64url_decode(concat!(
+            "cC4hiUPoj9Eetdgtv3hF80EGrhuB__dzERat0XF9g2VtQgr9PJbu3XOiZj5RZmh7",
+            "AAuHIm4Bh-0Qc_lF5YKt_O8W2Fp5jujGbds9uJdbF9CUAr7t1dnZcAcQjbKBYNX4",
+            "BAynRFdiuB--f_nZLgrnbyTyWzO75vRK5h6xBArLIARNPvkSjtQBMHlb1L07Qe7K",
+            "0GarZRmB_eSN9383LcOLn6_dO--xi12jzDwusC-eOkHWEsqtFZESc6BfI7noOPqv",
+            "hJ1phCnvWh6IeYI2w9QOYEUipUTI8np6LbgGY9Fs98rqVt5AXLIhWkWywlVmtVrB",
+            "p0igcN_IoypGlUPQGe77Rw"
+        ))
+        .unwrap();
+
+        assert!(verify_asymmetric(&header, &key, input.as_bytes(), &signature_bytes).is_ok());
+        assert!(verify_asymmetric(&header, &key, b"tampered", &signature_bytes).is_err());
+    }
+
+    #[test]
+    fn verifies_es256_rfc7515_vector() {
+        let header = Header {
+            alg: "ES256".to_string(),
+            kid: None,
+            typ: None,
+        };
+        let mut key = jwk("EC", "ES256", "rfc7515");
+        key.crv = Some("P-256".to_string());
+        key.x = Some("f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU".to_string());
+        key.y = Some("x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0".to_string());
+        let input = format!("eyJhbGciOiJFUzI1NiJ9.{}", PAYLOAD);
+        let signature_bytes = b64url_decode(concat!(
+            "DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSA",
+            "pmWQxfKTUJqPP3-Kg6NU1Q"
+        ))
+        .unwrap();
+
+        assert!(verify_asymmetric(&header, &key, input.as_bytes(), &signature_bytes).is_ok());
+        assert!(verify_asymmetric(&header, &key, b"tampered", &signature_bytes).is_err());
+    }
 }
