@@ -1,0 +1,31 @@
+{
+  "name": "Havanese Bichon SSO",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    }
+  },
+  "containerEnv": {
+    "BICHON_ROOT_DIR": "/tmp/bichon-data",
+    "BICHON_ENCRYPT_PASSWORD": "dev-password"
+  },
+  "mounts": [
+    "source=${localWorkspaceFolderBasename}-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+    "source=${localWorkspaceFolderBasename}-target,target=${containerWorkspaceFolder}/target,type=volume",
+    "source=${localWorkspaceFolderBasename}-node-modules,target=${containerWorkspaceFolder}/web/node_modules,type=volume"
+  ],
+  "postCreateCommand": "sudo chown -R vscode:vscode /usr/local/cargo/registry target web/node_modules && sudo corepack enable && sudo corepack prepare pnpm@9.15.9 --activate && git config --global --add safe.directory \"${containerWorkspaceFolder}\" && cd web && pnpm install --frozen-lockfile",
+  "forwardPorts": [15630, 5173],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "vitest.explorer"
+      ]
+    }
+  }
+}
